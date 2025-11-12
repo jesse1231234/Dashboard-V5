@@ -144,7 +144,10 @@ def build_echo_tables(
 
     Fractions are in [0..1]; charts display them as 0..100%.
     """
-    df = pd.read_csv(echo_csv_file)
+    if isinstance(echo_csv_file, pd.DataFrame):
+        df = echo_csv_file.copy()
+    else:
+        df = pd.read_csv(echo_csv_file)
 
     media_col = _find_col(df, CANDIDATES["media"], required=True)
     dur_col   = _find_col(df, CANDIDATES["duration"], required=True)

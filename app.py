@@ -1,4 +1,3 @@
-import io
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Optional
@@ -7,8 +6,9 @@ import pandas as pd
 import streamlit as st
 
 from services.canvas import CanvasService
-from processors.echo_adapter import build_echo_tables
-from processors.grades_adapter import build_gradebook_tables
+from services.echo360 import Echo360Service
+from processors.echo_adapter import EchoTables, build_echo_tables
+from processors.grades_adapter import GradebookTables, build_gradebook_tables
 from ui.charts import chart_gradebook_combo, chart_echo_combo
 from ui.helptext import HELP
 from ui.kpis import compute_kpis
@@ -59,7 +59,9 @@ def _set_wizard_center(on: bool):
 
 NOTICE = "No identifying information will be present in this analysis. All data will be de-identified."
 DEFAULT_BASE_URL = st.secrets.get("CANVAS_BASE_URL", "https://colostate.instructure.com")
+DEFAULT_ECHO_BASE_URL = st.secrets.get("ECHO360_BASE_URL", "https://api.echo360.org")
 TOKEN = st.secrets.get("CANVAS_TOKEN", "")
+ECHO_TOKEN = st.secrets.get("ECHO360_TOKEN", "")
 
 
 def render_notice(text: str, icon: str = "🔐") -> None:
@@ -98,24 +100,35 @@ def get_canvas_service(base_url: str, token: str) -> Iterator[CanvasService]:
     finally:
         svc.close()
 
-@st.cache_resource(show_spinner=True)
-def fetch_canvas_order_df(base_url: str, token: str, course_id: str) -> pd.DataFrame:
+@contextmanager
+def get_echo_service(base_url: str, token: str) -> Iterator[Echo360Service]:
+    svc = Echo360Service(base_url, token)
+    try:
+        yield svc
+    finally:
+        svc.close()
+
+
+def load_canvas_data(base_url: str, token: str, course_id: str) -> tuple[pd.DataFrame, GradebookTables, Optional[int]]:
     with get_canvas_service(base_url, token) as svc:
-        return svc.build_order_df(int(course_id))
-
-@st.cache_resource(show_spinner=False)
-def fetch_student_count(base_url: str, token: str, course_id: str) -> Optional[int]:
-    with get_canvas_service(base_url, token) as svc:
-        return svc.get_student_count(int(course_id))
-
-@st.cache_data(show_spinner=True)
-def run_echo_tables(file_bytes: bytes, canvas_df: pd.DataFrame, students_total: Optional[int]):
-    return build_echo_tables(io.BytesIO(file_bytes), canvas_df, class_total_students=students_total)
+        course_id_int = int(course_id)
+        canvas_df = svc.build_order_df(course_id_int)
+        gradebook_df = svc.build_gradebook_dataframe(course_id_int)
+        student_count = svc.get_student_count(course_id_int)
+    gradebook_tables = build_gradebook_tables(gradebook_df, canvas_df)
+    return canvas_df, gradebook_tables, student_count
 
 
-@st.cache_data(show_spinner=True)
-def run_gradebook_tables(file_bytes: bytes, canvas_df: pd.DataFrame):
-    return build_gradebook_tables(io.BytesIO(file_bytes), canvas_df)
+def load_echo_tables(
+    base_url: str,
+    token: str,
+    section_id: str,
+    canvas_df: pd.DataFrame,
+    students_total: Optional[int],
+ ) -> EchoTables:
+    with get_echo_service(base_url, token) as svc:
+        echo_df = svc.build_engagement_dataframe(section_id)
+    return build_echo_tables(echo_df, canvas_df, class_total_students=students_total)
 
 def sort_by_canvas_order(df: pd.DataFrame, module_col: str, canvas_df: pd.DataFrame) -> pd.DataFrame:
     """Sort a dataframe by Canvas module order using module_position; tolerate duplicate names."""
@@ -187,24 +200,34 @@ _state = st.session_state
 with st.sidebar:
     st.markdown("### Controls")
     if st.button("Restart wizard"):
-        for k in ["canvas", "echo", "grades", "results", "base_url", "course_id", "student_count"]:
+        for k in [
+            "canvas",
+            "echo",
+            "grades",
+            "results",
+            "base_url",
+            "course_id",
+            "student_count",
+            "echo_base_url",
+            "echo_section_id",
+        ]:
             _state.pop(k, None)
         _state.step = 1
         st.rerun()
 
-# Center steps 1–3 (call this BEFORE rendering any step UI)
-_set_wizard_center(_state.step in (1, 2, 3))
+# Center steps 1–2 (call this BEFORE rendering any step UI)
+_set_wizard_center(_state.step in (1, 2))
 
 # ---- Step 1 ----
 if _state.step == 1:
     step_header(
         1,
         "Connect to your Canvas course",
-        "Enter your Canvas domain and course number so we can pull module context for the dashboard.",
+        "Enter your Canvas domain and course number so we can pull module context and gradebook data automatically.",
         emoji="🧭",
     )
     render_notice(NOTICE)
-    base_url = st.text_input("Canvas Base URL", value=DEFAULT_BASE_URL)
+    base_url = st.text_input("Canvas Base URL", value=_state.get("base_url", DEFAULT_BASE_URL))
     course_id = st.text_input(
         "Please provide the Canvas Course Number contained in the URL for the Canvas Course you are analyzing. "
         "For example, if the URL for your home page is 'https://colostate.instructure.com/courses/123456', "
@@ -213,14 +236,17 @@ if _state.step == 1:
     if not TOKEN:
         st.warning("Missing CANVAS_TOKEN in Streamlit secrets. Add it before continuing.")
 
-    if st.button("Continue") and base_url and course_id and TOKEN:
+    if st.button("Fetch Canvas Data") and base_url and course_id and TOKEN:
         try:
-            with st.spinner("Fetching Canvas module order..."):
-                canvas_df = fetch_canvas_order_df(base_url, TOKEN, course_id)
+            with st.spinner("Fetching Canvas modules and gradebook data..."):
+                canvas_df, gradebook_tables, student_count = load_canvas_data(base_url, TOKEN, course_id)
                 _state["canvas"] = canvas_df
+                _state["grades"] = gradebook_tables
                 _state["base_url"] = base_url
                 _state["course_id"] = course_id
-                _state["student_count"] = fetch_student_count(base_url, TOKEN, course_id)  # may be None
+                _state["student_count"] = student_count
+                _state.pop("echo", None)
+                _state.pop("results", None)
                 _state.step = 2
                 st.rerun()
         except Exception as e:
@@ -230,47 +256,36 @@ if _state.step == 1:
 elif _state.step == 2:
     step_header(
         2,
-        "Upload Echo engagement CSV",
-        "We use this file to chart viewing behavior across modules.",
+        "Connect to Echo360 analytics",
+        "Provide your Echo360 API details so we can retrieve engagement data automatically.",
         emoji="🎬",
     )
     render_notice(NOTICE)
-    echo_csv = st.file_uploader("Please provide the CSV file containing your course's Echo data.", type=["csv"], key="echo_upload")
+    echo_base_url = st.text_input("Echo360 API Base URL", value=_state.get("echo_base_url", DEFAULT_ECHO_BASE_URL))
+    echo_section_id = st.text_input("Echo360 Section ID", value=_state.get("echo_section_id", ""))
 
-    if echo_csv and st.button("Continue", key="echo_continue"):
+    if not ECHO_TOKEN:
+        st.warning("Missing ECHO360_TOKEN in Streamlit secrets. Add it before continuing.")
+
+    if st.button("Fetch Echo Data") and echo_base_url and echo_section_id and ECHO_TOKEN:
         try:
-            with st.spinner("Processing Echo data..."):
-                _state["echo"] = run_echo_tables(
-                    echo_csv.getvalue(),
+            with st.spinner("Fetching Echo360 analytics..."):
+                echo_tables = load_echo_tables(
+                    echo_base_url,
+                    ECHO_TOKEN,
+                    echo_section_id,
                     _state["canvas"],
                     _state.get("student_count"),
                 )
+                _state["echo"] = echo_tables
+                _state["echo_base_url"] = echo_base_url
+                _state["echo_section_id"] = echo_section_id
+                _state["results"] = True
                 _state.step = 3
                 st.rerun()
         except Exception as e:
             st.error(f"Echo processing error: {e}")
 
-# ---- Step 3 ----
-elif _state.step == 3:
-    step_header(
-        3,
-        "Upload Canvas gradebook CSV",
-        "We'll marry assignment performance with your Echo engagement results.",
-        emoji="📝",
-    )
-    render_notice(NOTICE)
-    gb_csv = st.file_uploader("Please provide the CSV file containing your gradebook data.", type=["csv"], key="gradebook_upload")
-
-    if gb_csv and st.button("Process & View Dashboard", key="gradebook_process"):
-        try:
-            with st.spinner("Processing gradebook data..."):
-                _state["grades"] = run_gradebook_tables(gb_csv.getvalue(), _state["canvas"])
-                _state["results"] = True
-                _state.step = 4  # advance to dashboard step
-                st.rerun()
-        except Exception as e:
-            st.error(f"Gradebook processing error: {e}")
-            
 # ---------------- Dashboard ----------------
 if st.session_state.get("results"):
     st.divider()

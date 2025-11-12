@@ -1,7 +1,7 @@
 # services/canvas.py
 from __future__ import annotations
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import re
 
 import httpx
@@ -56,6 +56,43 @@ class CanvasService:
 
         return out
 
+    @staticmethod
+    def _clean_assignment_title(name: str) -> str:
+        """Mimic Canvas CSV export header cleaning for assignments."""
+        if not name:
+            return ""
+        s = str(name).strip()
+
+        if s.endswith(")") and "(" in s:
+            i = s.rfind("(")
+            digits = s[i + 1 : -1]
+            if digits.isdigit() and len(digits) >= 4:
+                s = s[:i].rstrip()
+
+        if "-" in s:
+            left, right = s.rsplit("-", 1)
+            if right.strip().isdigit() and len(right.strip()) >= 4:
+                s = left.strip()
+
+        return s
+
+    @staticmethod
+    def _dedupe_titles(titles: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+        """Ensure assignment titles are unique while preserving order."""
+        seen: Dict[str, int] = {}
+        out: List[Tuple[int, str]] = []
+        for aid, title in titles:
+            base = title or "Assignment"
+            count = seen.get(base, 0)
+            if count == 0:
+                unique = base
+            else:
+                unique = f"{base} ({count + 1})"
+            seen[base] = count + 1
+            seen[unique] = 1
+            out.append((aid, unique))
+        return out
+
     # Title cleanup patterns: (hh:mm[:ss]), "(read only)", "- 12345"
     _DUR_TAIL_RE   = re.compile(r"\s*\((?:\d{1,2}:)?\d{1,2}:\d{2}\)\s*$", re.I)
     _READONLY_RE   = re.compile(r"\s*\(read only\)\s*$", re.I)
@@ -77,6 +114,26 @@ class CanvasService:
         """Prefer a single call with include=items to preserve natural item order."""
         url = f"{self.base_url}/api/v1/courses/{course_id}/modules"
         return self._get_all(url, params={"per_page": 100, "include[]": "items"})
+
+    def list_assignments(self, course_id: int) -> List[Dict]:
+        url = f"{self.base_url}/api/v1/courses/{course_id}/assignments"
+        params = {"per_page": 100, "include[]": ["submission_types", "grading_type"]}
+        return self._get_all(url, params=params)
+
+    def list_student_enrollments(self, course_id: int) -> List[Dict]:
+        url = f"{self.base_url}/api/v1/courses/{course_id}/enrollments"
+        params = {
+            "per_page": 100,
+            "type[]": "StudentEnrollment",
+            "state[]": "active",
+            "include[]": ["grades", "user"],
+        }
+        return self._get_all(url, params=params)
+
+    def list_submissions(self, course_id: int) -> List[Dict]:
+        url = f"{self.base_url}/api/v1/courses/{course_id}/students/submissions"
+        params = {"per_page": 100, "student_ids[]": "all"}
+        return self._get_all(url, params=params)
 
     def get_page_body(self, course_id: int, page_url: str) -> str:
         """Fetch a Canvas page body (HTML)."""
@@ -184,6 +241,98 @@ class CanvasService:
 
         df = pd.DataFrame(rows)
         return df
+
+    def build_gradebook_dataframe(self, course_id: int) -> pd.DataFrame:
+        """Assemble a Canvas gradebook shaped like the CSV export but via API calls."""
+        assignments = self.list_assignments(course_id)
+        enrollments = self.list_student_enrollments(course_id)
+        submissions = self.list_submissions(course_id)
+
+        if not enrollments:
+            return pd.DataFrame(columns=["Student"])
+
+        graded_assignments: List[Dict] = []
+        for a in assignments:
+            grading_type = (a.get("grading_type") or "").lower()
+            if grading_type == "not_graded":
+                continue
+            submission_types = [t.lower() for t in (a.get("submission_types") or [])]
+            if submission_types and all(t == "not_graded" for t in submission_types):
+                continue
+            graded_assignments.append(a)
+
+        cleaned_titles = [
+            (a.get("id"), self._clean_assignment_title(a.get("name")))
+            for a in graded_assignments
+            if a.get("id") is not None
+        ]
+        unique_titles = self._dedupe_titles(cleaned_titles)
+
+        assignment_lookup = {a.get("id"): a for a in graded_assignments}
+        submission_lookup: Dict[Tuple[int, int], float | None] = {}
+        for sub in submissions:
+            user_id = sub.get("user_id")
+            assignment_id = sub.get("assignment_id")
+            if user_id is None or assignment_id is None:
+                continue
+            if assignment_id not in assignment_lookup:
+                continue
+            submission_lookup[(int(user_id), int(assignment_id))] = sub.get("score")
+
+        meta_cols = [
+            "Student",
+            "SIS User ID",
+            "SIS Login ID",
+            "Integration ID",
+            "ID",
+            "Section",
+            "Final Grade",
+            "Current Grade",
+            "Unposted Final Grade",
+            "Final Score",
+            "Current Score",
+            "Unposted Final Score",
+        ]
+        assignment_cols = [title for _, title in unique_titles]
+        columns = meta_cols + assignment_cols
+
+        rows: List[Dict[str, object]] = []
+        points_row = {col: None for col in columns}
+        points_row["Student"] = "Points Possible"
+        for assignment_id, title in unique_titles:
+            points_row[title] = assignment_lookup.get(assignment_id, {}).get("points_possible")
+        rows.append(points_row)
+
+        for enrollment in enrollments:
+            row = {col: None for col in columns}
+            user = enrollment.get("user") or {}
+            grades = enrollment.get("grades") or {}
+            row["Student"] = (
+                user.get("sortable_name")
+                or user.get("name")
+                or enrollment.get("user_id")
+                or "Student"
+            )
+            row["SIS User ID"] = enrollment.get("sis_user_id") or user.get("sis_user_id")
+            row["SIS Login ID"] = enrollment.get("sis_login_id") or user.get("login_id")
+            row["Integration ID"] = enrollment.get("integration_id")
+            row["ID"] = enrollment.get("user_id")
+            row["Section"] = enrollment.get("course_section_id")
+            row["Final Grade"] = grades.get("final_grade")
+            row["Current Grade"] = grades.get("current_grade")
+            row["Unposted Final Grade"] = grades.get("unposted_final_grade")
+            row["Final Score"] = grades.get("final_score")
+            row["Current Score"] = grades.get("current_score")
+            row["Unposted Final Score"] = grades.get("unposted_final_score")
+
+            user_id = enrollment.get("user_id")
+            for assignment_id, title in unique_titles:
+                if user_id is None:
+                    continue
+                row[title] = submission_lookup.get((int(user_id), int(assignment_id)))
+            rows.append(row)
+
+        return pd.DataFrame(rows, columns=columns)
 
     # ---------------- Enrollments (preferred student count) ----------------
 
