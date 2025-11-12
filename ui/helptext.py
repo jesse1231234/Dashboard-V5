@@ -42,7 +42,7 @@ _DEFAULT_ECHO_MODULE_COLUMNS = {
 }
 
 _DEFAULT_GRADEBOOK = {
-    "GRADEBOOK_SUMMARY_DEFAULT": "Assignment-level metrics aggregated from the Canvas gradebook export.",
+    "GRADEBOOK_SUMMARY_DEFAULT": "Assignment-level metrics aggregated from Canvas gradebook API data.",
 }
 
 _DEFAULT_GRADEBOOK_MODULE_COLUMNS = {

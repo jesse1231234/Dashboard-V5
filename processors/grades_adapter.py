@@ -109,7 +109,10 @@ def build_gradebook_tables(gradebook_csv_file, canvas_order_df: pd.DataFrame) ->
       - Rows 1..N are students (we’ll de-identify).
       - Percentages returned as fractions 0..1.
     """
-    gb_raw = pd.read_csv(gradebook_csv_file)
+    if isinstance(gradebook_csv_file, pd.DataFrame):
+        gb_raw = gradebook_csv_file.copy()
+    else:
+        gb_raw = pd.read_csv(gradebook_csv_file)
 
     # Clean headers (strip trailing numeric IDs)
     gb_raw.columns = [_clean_assignment_header(c) for c in gb_raw.columns]
