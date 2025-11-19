@@ -106,7 +106,7 @@ Instructions:
 - identify general trends and data points worthy of further investigation.
 - No need to list each section of the course individually. Simply call out aspects of the data that seem important for further investigation.
 """
-        """
+    
     # build payload above as you already do...
 
     client = _get_azure_openai_client()
